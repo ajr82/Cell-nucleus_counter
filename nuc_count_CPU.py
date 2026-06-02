@@ -21,13 +21,14 @@ import cv2
 import numpy as np
 import os
 import json
+import time
 
 # Try to import ultralytics YOLO
 try:
     from ultralytics import YOLO
 except Exception as e:
     YOLO = None
-    _ultralytics_import_error = e
+    print(f"Ultralytics import error: {e}")
 
 # Try to import SAHI for tiled inference (Using standard stable imports)
 try:
@@ -52,7 +53,6 @@ CLASS_NAMES = {
 
 INFERENCE_SIZE = 640  
 CONF_THRESHOLD = 0.25
-IOU_THRESHOLD = 0.45
 
 # Strictly enforce CPU mode
 DEVICE = "cpu"
@@ -217,66 +217,18 @@ def get_stylesheet():
 # -----------------
 # Image Enhancement Functions
 # -----------------
-def apply_clahe(img_bgr, clip_limit=2.0):
-    """Applies Contrast Limited Adaptive Histogram Equalization to the L channel in LAB color space."""
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=max(0.1, float(clip_limit)), tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-
-def apply_unsharp_mask(img_bgr, kernel_size=(5, 5), sigma=1.0, amount=1.0, threshold=0):
-    """Applies an unsharp mask to enhance edges."""
-    blurred = cv2.GaussianBlur(img_bgr, kernel_size, sigma)
-    sharpened = float(amount + 1) * img_bgr - float(amount) * blurred
-    sharpened = np.maximum(sharpened, np.zeros(sharpened.shape))
-    sharpened = np.minimum(sharpened, 255 * np.ones(sharpened.shape))
-    sharpened = sharpened.round().astype(np.uint8)
-    if threshold > 0:
-        low_contrast_mask = np.absolute(img_bgr - blurred) < threshold
-        np.copyto(sharpened, img_bgr, where=low_contrast_mask)
-    return sharpened
-
-def apply_gamma(img_bgr, gamma=1.0):
-    """Applies Gamma Correction to the image."""
-    inv_gamma = 1.0 / (gamma + 1e-6)
-    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-    return cv2.LUT(img_bgr, table)
-
-def apply_median_blur(img_bgr, ksize=3):
-    """Applies Median Blur to reduce noise while preserving edges."""
-    ksize = max(1, int(ksize))
-    if ksize % 2 == 0: 
-        ksize += 1
-    return cv2.medianBlur(img_bgr, ksize)
-
-def apply_reinhard(img_bgr, alpha=1.0):
-    """Applies Reinhard stain normalization using stable standard target statistics."""
-    # Typical target statistics for a well-balanced DAB/Hematoxylin stain in LAB space
-    target_means = np.array([140.0, 135.0, 130.0]) 
-    target_stds = np.array([35.0, 10.0, 15.0])
+def apply_macenko_calibration(img_bgr):
+    """Lighter auto-white balance mimicking Macenko's background correction."""
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_flat = img_rgb.reshape(-1, 3)
+    bg_color = np.percentile(img_flat, 95, axis=0)
+    bg_color = np.maximum(bg_color, 10.0) # Avoid division by zero
     
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    means, stds = cv2.meanStdDev(lab)
-    means = np.array(means).flatten()
-    stds = np.array(stds).flatten()
-    
-    stds = np.maximum(stds, 1e-5) # Prevent division by zero
-    
-    for i in range(3):
-        lab[:, :, i] = ((lab[:, :, i] - means[i]) * (target_stds[i] / stds[i])) + target_means[i]
-        
-    lab = np.clip(lab, 0, 255).astype(np.uint8)
-    norm_bgr = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    
-    # Blend image based on slider strength
-    if alpha >= 1.0:
-        return norm_bgr
-    return cv2.addWeighted(norm_bgr, alpha, img_bgr, 1.0 - alpha, 0)
+    img_norm = np.clip((img_rgb / bg_color) * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(img_norm, cv2.COLOR_RGB2BGR)
 
-def apply_vahadane(img_bgr, alpha=1.0):
-    """Applies Vahadane-style structure-preserving stain normalization."""
+def apply_vahadane(img_bgr, alpha=0.10):
+    """Structure-preserving stain normalization mapped to stable target statistics."""
     target_HE = np.array([[0.5626, 0.2159], [0.7201, 0.8012], [0.4062, 0.5581]])
     target_max_C = np.array([1.9705, 1.0308])
 
@@ -318,116 +270,88 @@ def apply_vahadane(img_bgr, alpha=1.0):
         return norm_bgr
     return cv2.addWeighted(norm_bgr, alpha, img_bgr, 1.0 - alpha, 0)
 
-def apply_bilateral(img_bgr, d=9):
-    """Applies Bilateral Filter to reduce noise while keeping edges sharp."""
-    return cv2.bilateralFilter(img_bgr, max(1, int(d)), 75, 75)
+def apply_clahe(img_bgr, clip_limit=0.5):
+    """Applies Contrast Limited Adaptive Histogram Equalization to the L channel."""
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=max(0.1, float(clip_limit)), tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-def apply_sobel(img_bgr, alpha=0.5):
-    """Applies Sobel Edge Filter blended with the original image."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    grad_x = cv2.Sobel(gray, cv2.CV_16S, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_16S, 0, 1, ksize=3)
-    abs_grad_x = cv2.convertScaleAbs(grad_x)
-    abs_grad_y = cv2.convertScaleAbs(grad_y)
-    sobel_edges = cv2.addWeighted(abs_grad_x, 0.5, abs_grad_y, 0.5, 0)
-    sobel_bgr = cv2.cvtColor(sobel_edges, cv2.COLOR_GRAY2BGR)
-    if alpha >= 1.0: return sobel_bgr
-    return cv2.addWeighted(sobel_bgr, alpha, img_bgr, 1.0 - alpha, 0)
-
-def apply_canny(img_bgr, alpha=0.5):
-    """Applies Canny Edge Filter blended with the original image."""
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
-    edges_bgr = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-    if alpha >= 1.0: return edges_bgr
-    return cv2.addWeighted(edges_bgr, alpha, img_bgr, 1.0 - alpha, 0)
+def apply_unsharp_mask(img_bgr, kernel_size=(5, 5), sigma=1.0, amount=0.5, threshold=0):
+    """Applies an unsharp mask to enhance edges."""
+    blurred = cv2.GaussianBlur(img_bgr, kernel_size, sigma)
+    sharpened = float(amount + 1) * img_bgr - float(amount) * blurred
+    sharpened = np.maximum(sharpened, np.zeros(sharpened.shape))
+    sharpened = np.minimum(sharpened, 255 * np.ones(sharpened.shape))
+    sharpened = sharpened.round().astype(np.uint8)
+    if threshold > 0:
+        low_contrast_mask = np.absolute(img_bgr - blurred) < threshold
+        np.copyto(sharpened, img_bgr, where=low_contrast_mask)
+    return sharpened
 
 
 # -----------------
-# Helper Function for Universal Inference (Screenshot Mode)
+# Helper Function for YOLO SAHI Inference & Localized Shape Filtering
 # -----------------
-def run_screenshot_inference(img_rgb, model, current_option, class_names_map, 
-                           progress_callback=None, invert_classes=False,
-                           use_clahe=False, clahe_val=2.0,
-                           use_unsharp=False, unsharp_val=1.0,
-                           use_gamma=False, gamma_val=1.0,
-                           use_blur=False, blur_val=3,
-                           use_bilateral=False, bilateral_val=9,
-                           use_norm=False, norm_val=1.0,
-                           use_vahadane=False, vahadane_val=1.0,
-                           use_sobel=False, sobel_val=0.5,
-                           use_canny=False, canny_val=0.5):
-    """
-    Universal wrapper to handle optimized CPU SAHI/YOLO.
-    """
-    counts = {0: 0, 1: 0} # Default fallback counts
-    kpi_text = ""
-    active_class_names = class_names_map.get(current_option, ["Positive cells", "Negative cells"])
-    boxes_out = []
+def run_screenshot_inference(img_rgb, model, current_option, progress_callback=None, invert_classes=False,
+                           use_macenko=True, use_vahadane=True, vahadane_val=0.10,
+                           use_clahe=True, clahe_val=0.5, use_unsharp=True, unsharp_val=0.5,
+                           include_all_cells=False, size_pct_thresh=0.30, circ_thresh=0.40, round_thresh=0.40):
     
-    # 0 = Positive, 1 = Negative. Toggle cleanly inverts this mapping.
-    pos_class_id = 1 if invert_classes else 0
-    neg_class_id = 0 if invert_classes else 1
+    boxes_out = []
     
     try:
         if progress_callback:
-            progress_callback(5, "Running YOLO_SAHI network on CPU...")
+            progress_callback(5, "Enhancing image and loading YOLO_SAHI...")
             
-        # Conversion ensuring stains are correctly colored for the YOLO model processing
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         
-        # --- Apply pre-processing enhancements ---
-        if use_blur:
-            if progress_callback:
-                progress_callback(6, "Applying Median Blur...")
-            img_bgr = apply_median_blur(img_bgr, blur_val)
-
-        if use_bilateral:
-            if progress_callback:
-                progress_callback(8, "Applying Bilateral Filtering...")
-            img_bgr = apply_bilateral(img_bgr, bilateral_val)
-            
-        if use_norm:
-            if progress_callback:
-                progress_callback(10, "Applying Reinhard Normalization...")
-            img_bgr = apply_reinhard(img_bgr, norm_val)
+        # --- Apply sequential pre-processing enhancements ---
+        if use_macenko:
+            if progress_callback: progress_callback(8, "Auto-calibrating background...")
+            img_bgr = apply_macenko_calibration(img_bgr)
             
         if use_vahadane:
-            if progress_callback:
-                progress_callback(12, "Applying Vahadane Normalization...")
-            img_bgr = apply_vahadane(img_bgr, vahadane_val)
-            
-        if use_gamma:
-            if progress_callback:
-                progress_callback(14, "Applying Gamma Correction...")
-            img_bgr = apply_gamma(img_bgr, gamma_val)
+            if progress_callback: progress_callback(12, "Applying Vahadane Stain Normalization...")
+            img_bgr = apply_vahadane(img_bgr, alpha=vahadane_val)
 
         if use_clahe:
-            if progress_callback:
-                progress_callback(16, "Applying CLAHE enhancement...")
-            img_bgr = apply_clahe(img_bgr, clahe_val)
+            if progress_callback: progress_callback(16, "Applying CLAHE enhancement...")
+            img_bgr = apply_clahe(img_bgr, clip_limit=clahe_val)
             
         if use_unsharp:
-            if progress_callback:
-                progress_callback(18, "Applying Unsharp Masking...")
+            if progress_callback: progress_callback(20, "Applying Unsharp Masking...")
             img_bgr = apply_unsharp_mask(img_bgr, amount=unsharp_val)
+
+        # Pre-compute DAB channel globally for ER/PR intensity calculation AND KI67 Override
+        if current_option in ["ER/PR analysis", "KI67 analysis"]:
+            if progress_callback: progress_callback(30, "Calculating global DAB Intensities...")
+            HDAB_matrix = np.array([
+                [0.644, 0.716, 0.266], # Hematoxylin
+                [0.268, 0.570, 0.776], # DAB
+                [0.711, 0.423, 0.561]  # Residual
+            ], dtype=np.float32)
+            HDAB_inv = np.linalg.inv(HDAB_matrix)
             
-        if use_sobel:
-            if progress_callback:
-                progress_callback(20, "Applying Sobel Edge Filter...")
-            img_bgr = apply_sobel(img_bgr, sobel_val)
-            
-        if use_canny:
-            if progress_callback:
-                progress_callback(22, "Applying Canny Edge Filter...")
-            img_bgr = apply_canny(img_bgr, canny_val)
+            img_rgb_float = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+            img_flat = img_rgb_float.reshape(-1, 3)
+            bg_color = np.percentile(img_flat, 95, axis=0)
+            bg_color = np.maximum(bg_color, 10.0)
+            img_norm = (img_rgb_float + 1.0) / bg_color
+            OD = -np.log10(np.clip(img_norm, 1e-4, 1.0))
+            C = np.dot(OD, HDAB_inv)
+            dab_channel = C[:, :, 1]
             
         # The returned image will be solely the processed RGB (no boxes drawn natively)
         drawn_blend_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # --- EVALUATE AS DETECTION BOUNDING BOXES ONLY ---
+        if progress_callback: progress_callback(40, "Running Tiled Inference (SAHI)...")
+
+        # --- EVALUATE BOUNDING BOXES ---
         results = get_sliced_prediction(
-            image=img_bgr, # SAHI slices the BGR image directly so YOLO sees proper colors
+            image=img_bgr, 
             detection_model=model,
             slice_height=640,
             slice_width=640,
@@ -436,66 +360,161 @@ def run_screenshot_inference(img_rgb, model, current_option, class_names_map,
             verbose=False
         )
         
+        if progress_callback: progress_callback(70, "Filtering and analyzing cell morphology...")
+        
+        raw_objects = []
+        pos_areas = []
+        
+        # Pass 1: Collect boxes and compute areas for median analysis
         for obj in results.object_prediction_list:
-            # Stable bounding box extraction across SAHI versions
-            x1 = int(obj.bbox.minx)
-            y1 = int(obj.bbox.miny)
-            x2 = int(obj.bbox.maxx)
-            y2 = int(obj.bbox.maxy)
+            x1, y1 = int(obj.bbox.minx), int(obj.bbox.miny)
+            x2, y2 = int(obj.bbox.maxx), int(obj.bbox.maxy)
             
+            # Use original exact SAHI mapping logic:
             raw_cls_id = int(obj.category.id)
-            
-            # --- STRICT SAHI INVERSION MAPPING ---
-            # SAHI inherently assigns swapped indices (alphabetical override)
-            # We explicitly swap 0 to 1, and 1 to 0 here to normalize it.
             cls_id = 1 - raw_cls_id
             
-            is_pos = False
-            is_neg = False
+            if invert_classes:
+                cls_id = 1 - cls_id
             
-            if cls_id == pos_class_id:
-                is_pos = True
-            elif cls_id == neg_class_id:
-                is_neg = True
+            box_area = (x2 - x1) * (y2 - y1)
             
-            if is_pos:
-                counts[0] = counts.get(0, 0) + 1  # 0 is the UI 'Positive' slot
-            elif is_neg:
-                counts[1] = counts.get(1, 0) + 1  # 1 is the UI 'Negative' slot
-            else:
-                counts[cls_id] = counts.get(cls_id, 0) + 1
+            if cls_id == 0:  # 0 is strictly Positive across all apps
+                pos_areas.append(box_area)
                 
+            raw_objects.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'cls_id': cls_id, 'area': box_area})
+            
+        median_pos_area = np.median(pos_areas) if pos_areas else 0
+        min_area_thresh = median_pos_area * size_pct_thresh
+        
+        H, W, _ = img_bgr.shape
+        
+        # Pass 2: Filter by Relative Size, Cellularity, and Roundness, AND Override DAB
+        for idx, obj in enumerate(raw_objects):
+            if progress_callback and idx % 20 == 0:
+                progress_callback(70 + int(25 * (idx / max(1, len(raw_objects)))), "Filtering shapes...")
+
+            x1, y1, x2, y2 = obj['x1'], obj['y1'], obj['x2'], obj['y2']
+            cls_id = obj['cls_id']
+            box_area = obj['area']
+            
+            mask_valid = False
+            skip_cell = False
+            
+            # Compute a cell mask if required for Shape Filtering OR ER/PR/KI67 intensity overrides
+            needs_mask = (not include_all_cells and (circ_thresh > 0 or round_thresh > 0)) or \
+                         (current_option == "ER/PR analysis" and cls_id == 0) or \
+                         (current_option in ["KI67 analysis", "ER/PR analysis"] and cls_id == 1)
+            
+            if needs_mask:
+                pad = 2
+                rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+                rx2, ry2 = min(W, x2 + pad), min(H, y2 + pad)
+                
+                roi = img_bgr[ry1:ry2, rx1:rx2]
+                if roi.size > 0:
+                    # Create mask within bounding box to isolate the actual cell shape
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    gray_roi = cv2.GaussianBlur(gray_roi, (3, 3), 0)
+                    _, mask = cv2.threshold(gray_roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+                    mask_valid = True
+            
+            # Apply strict filtering if Include All Cells is OFF
+            if not include_all_cells:
+                # 1. Size Filter
+                if size_pct_thresh > 0 and box_area < min_area_thresh:
+                    continue
+                    
+                # 2. Shape Filter (Cellularity & Roundness)
+                if mask_valid and (circ_thresh > 0 or round_thresh > 0):
+                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if not contours:
+                        skip_cell = True
+                    else:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        contour_area = cv2.contourArea(largest_contour)
+                        perimeter = cv2.arcLength(largest_contour, True)
+                        
+                        if perimeter > 0:
+                            circularity = 4 * np.pi * (contour_area / (perimeter ** 2))
+                            if circularity < circ_thresh:
+                                skip_cell = True
+                        
+                        if not skip_cell and round_thresh > 0:
+                            if len(largest_contour) >= 5:
+                                rect = cv2.fitEllipse(largest_contour)
+                                major_axis = max(rect[1][0], rect[1][1])
+                                if major_axis > 0:
+                                    roundness = 4 * contour_area / (np.pi * (major_axis ** 2))
+                                    if roundness < round_thresh:
+                                        skip_cell = True
+                            else:
+                                rect = cv2.minAreaRect(largest_contour)
+                                major_axis = max(rect[1][0], rect[1][1])
+                                if major_axis > 0:
+                                    roundness = 4 * contour_area / (np.pi * (major_axis ** 2))
+                                    if roundness < round_thresh:
+                                        skip_cell = True
+                elif (circ_thresh > 0 or round_thresh > 0) and not mask_valid:
+                    # Drop cell if we require shape thresholds but couldn't compute a mask
+                    skip_cell = True
+                    
+            if skip_cell:
+                continue
+                                
+            # --- Color-based Reclassification ---
+            
+            # 1. KI67 & ER/PR DAB Override: If YOLO thinks it's Negative, but it's very brown
+            if current_option in ["KI67 analysis", "ER/PR analysis"] and cls_id == 1:
+                pad = 2
+                rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+                rx2, ry2 = min(W, x2 + pad), min(H, y2 + pad)
+                dab_roi = dab_channel[ry1:ry2, rx1:rx2]
+                
+                if mask_valid and mask.shape == dab_roi.shape and np.any(mask > 0):
+                    mean_dab = np.mean(dab_roi[mask > 0])
+                else:
+                    mean_dab = np.mean(dab_roi) if dab_roi.size > 0 else 0
+                    
+                if mean_dab >= 0.15:  # Sufficient brown pigment detected
+                    cls_id = 0  # Override YOLO and force to Positive
+                    
+            # 2. ER/PR Intensity Sub-classification
+            if current_option == "ER/PR analysis" and cls_id == 0:
+                pad = 2
+                rx1, ry1 = max(0, x1 - pad), max(0, y1 - pad)
+                rx2, ry2 = min(W, x2 + pad), min(H, y2 + pad)
+                dab_roi = dab_channel[ry1:ry2, rx1:rx2]
+                
+                if mask_valid and mask.shape == dab_roi.shape and np.any(mask > 0):
+                    mean_dab = np.mean(dab_roi[mask > 0])
+                else:
+                    mean_dab = np.mean(dab_roi) if dab_roi.size > 0 else 0
+                    
+                if mean_dab < 0.35:
+                    cls_id = 2 # Weak (Yellow)
+                elif mean_dab < 0.60:
+                    cls_id = 3 # Moderate (Orange)
+                else:
+                    cls_id = 4 # Strong (Red)
+            
             # Append box coordinates for dynamic UI drawing
-            # List format: [x1, y1, x2, y2, cls_id]
             boxes_out.append([x1, y1, x2, y2, cls_id])
             
-        # --- DETECTION KPI CALCULATION ---
-        c0 = counts.get(0, 0)
-        c1 = counts.get(1, 0)
-        denom = c0 + c1
-        pct = (c0 / denom * 100.0) if denom > 0 else 0.0
-        
-        if current_option == "ER/PR analysis":
-            kpi_text = f"ER/PR Positive Index: {pct:.1f}%"
-        else:
-            kpi_text = f"KI67 index : {pct:.1f}%"
-            
-        return drawn_blend_rgb, counts, kpi_text, active_class_names, boxes_out
+        return drawn_blend_rgb, boxes_out
 
     except Exception as e:
         print(f"Inference error: {e}")
-        # Return original RGB if there's an error
         drawn_blend_rgb = img_rgb.copy()
-        kpi_text = "Inference Error"
 
-    return drawn_blend_rgb, counts, kpi_text, active_class_names, boxes_out
+    return drawn_blend_rgb, boxes_out
 
 
 # -----------------
 # Zoomable & Editable Image Viewer Widget
 # -----------------
 class ImageSliderWidget(QWidget):
-    # Add a signal to emit when an edit occurs
+    # Emit signal when bounding box is manually added/removed/edited
     edits_changed = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -512,15 +531,15 @@ class ImageSliderWidget(QWidget):
         self.zoom = 1.0
         self.pan = QPointF(0.0, 0.0)
         self.last_pan_pos = QPointF(0.0, 0.0)
-        self.default_box_size = 20  # Reduced by 60% for manually added boxes
+        self.default_box_size = 16  # Shrunk manually added boxes to reduce clutter
         
-        self.mode = 'camera' 
+        self.mode = 'screenshot' 
         self.placeholder_text = "Select an AI model to begin"
         self.setMouseTracking(True)
         self.setMinimumSize(640, 480)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
-        # Reset View Button
+        # Reset View Button overlay
         self.btn_reset_view = QPushButton("Reset View", self)
         self.btn_reset_view.setStyleSheet("""
             QPushButton {
@@ -539,7 +558,6 @@ class ImageSliderWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Reposition the reset button to the top right corner
         self.btn_reset_view.move(self.width() - self.btn_reset_view.width() - 10, 10)
 
     def set_placeholder_text(self, text):
@@ -558,7 +576,6 @@ class ImageSliderWidget(QWidget):
         self.processed_pixmap = QPixmap.fromImage(processed_qimg)
         if original_qimg:
             self.original_pixmap = QPixmap.fromImage(original_qimg)
-            self.mode = 'screenshot'
             self.slider_pos = 0.5 
         else:
             self.original_pixmap = None
@@ -569,7 +586,7 @@ class ImageSliderWidget(QWidget):
         self.update()
 
     def fit_to_view(self):
-        """Calculates initial pan and zoom to fit the image into the view with 5% margin."""
+        """Centers the image into the widget bounds with a 5% margin."""
         if not self.processed_pixmap: 
             return
         
@@ -589,16 +606,14 @@ class ImageSliderWidget(QWidget):
         self.update()
 
     def map_to_image(self, widget_pos):
-        """Converts widget QPointF to underlying Image coordinates."""
+        """Converts cursor position back to the raw image coordinates."""
         img_x = (widget_pos.x() - self.pan.x()) / self.zoom
         img_y = (widget_pos.y() - self.pan.y()) / self.zoom
         return img_x, img_y
 
     def add_box_at(self, img_x, img_y, cls_id):
-        """Manually inserts a new bounding box at the clicked coordinates."""
         if not self.processed_pixmap: return
-        
-        # Boundary check: ensure the click is actually inside the image
+        # Prevent boxes completely outside image boundaries
         if not (0 <= img_x <= self.processed_pixmap.width() and 0 <= img_y <= self.processed_pixmap.height()):
             return
             
@@ -609,30 +624,28 @@ class ImageSliderWidget(QWidget):
         y2 = min(self.processed_pixmap.height(), img_y + s/2)
         self.boxes.append([x1, y1, x2, y2, cls_id])
         self.update()
-        self.edits_changed.emit() # Auto-trigger recalculation
+        self.edits_changed.emit()
         
     def delete_box_at(self, img_x, img_y):
-        """Deletes the bounding box found under the click."""
         for i in reversed(range(len(self.boxes))):
             x1, y1, x2, y2, _ = self.boxes[i]
             if x1 <= img_x <= x2 and y1 <= img_y <= y2:
                 self.boxes.pop(i)
                 self.update()
-                self.edits_changed.emit() # Auto-trigger recalculation
+                self.edits_changed.emit()
                 return
                 
     def change_box_class_at(self, img_x, img_y, cls_id):
-        """Changes the class of the bounding box located at the click."""
         for i in reversed(range(len(self.boxes))):
             x1, y1, x2, y2, _ = self.boxes[i]
             if x1 <= img_x <= x2 and y1 <= img_y <= y2:
                 self.boxes[i][4] = cls_id
                 self.update()
-                self.edits_changed.emit() # Auto-trigger recalculation
+                self.edits_changed.emit()
                 return
 
     def wheelEvent(self, event):
-        """Handles zooming with the mouse wheel toward the cursor position."""
+        """Mouse wheel zooms in towards cursor."""
         if not self.processed_pixmap: 
             return
             
@@ -645,44 +658,41 @@ class ImageSliderWidget(QWidget):
         else:
             self.zoom *= zoom_out_factor
             
-        self.zoom = max(0.1, min(self.zoom, 15.0))
+        self.zoom = max(0.05, min(self.zoom, 15.0))
         
         mouse_pos = event.position()
         self.pan = mouse_pos - (mouse_pos - self.pan) * (self.zoom / old_zoom)
         self.update()
 
     def mousePressEvent(self, event):
-        if self.mode != 'screenshot' or not self.processed_pixmap: 
+        if not self.processed_pixmap: 
             return
             
         split_x_widget = int(self.width() * self.slider_pos)
-        
-        # Priority 1: Check Slider interaction
         if abs(event.position().x() - split_x_widget) < 20:
             self.is_dragging = True
             return
             
-        # Priority 2: Panning/Adding/Deleting
         if event.button() == Qt.MouseButton.MiddleButton:
             self.is_panning = True
             self.last_pan_pos = event.position()
         elif event.button() == Qt.MouseButton.LeftButton:
             img_x, img_y = self.map_to_image(event.position())
-            self.add_box_at(img_x, img_y, 0) # 0 = Positive
+            # For manual addition, we default to 0 (Strong positive or KI67 positive)
+            self.add_box_at(img_x, img_y, 0)
         elif event.button() == Qt.MouseButton.RightButton:
             img_x, img_y = self.map_to_image(event.position())
             self.delete_box_at(img_x, img_y)
             
     def mouseDoubleClickEvent(self, event):
-        if self.mode != 'screenshot' or not self.processed_pixmap: 
+        if not self.processed_pixmap: 
             return
-            
         if event.button() == Qt.MouseButton.LeftButton:
             img_x, img_y = self.map_to_image(event.position())
-            self.change_box_class_at(img_x, img_y, 1) # Change to Negative
+            self.change_box_class_at(img_x, img_y, 1) # Double click transforms to Negative
 
     def mouseMoveEvent(self, event):
-        if self.mode != 'screenshot' or not self.processed_pixmap: 
+        if not self.processed_pixmap: 
             return
             
         split_x_widget = int(self.width() * self.slider_pos)
@@ -727,13 +737,25 @@ class ImageSliderWidget(QWidget):
         # --- DRAW BOXES ---
         for box in self.boxes:
             x1, y1, x2, y2, cls_id = box
-            color = QColor(255, 0, 0) if cls_id == 0 else QColor(6, 148, 148)
+            
+            # Map class ID to UI colors dynamically
+            if cls_id == 0 or cls_id == 4:
+                color = QColor(255, 0, 0) # Red (Positive / Strong)
+            elif cls_id == 1:
+                color = QColor(0, 0, 255) # Blue (Negative)
+            elif cls_id == 2:
+                color = QColor(255, 255, 0) # Yellow (Weak)
+            elif cls_id == 3:
+                color = QColor(255, 165, 0) # Orange (Moderate)
+            else:
+                color = QColor(0, 255, 0) # Fallback
+
             pen = QPen(color, max(1, int(2 / self.zoom))) # Normalize thickness against zoom
             painter.setPen(pen)
             painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
             
         # --- DRAW ORIGINAL RAW SIDE (Clipped) ---
-        if self.mode == 'screenshot' and self.original_pixmap is not None:
+        if self.original_pixmap is not None:
             painter.resetTransform()
             split_x_widget = rect.width() * self.slider_pos
             
@@ -846,7 +868,7 @@ class SnippingWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Nuclear stain counter (CPU)")
+        self.setWindowTitle("Nuclear stain counter (CPU Only)")
         
         # Add window icon
         icon_path = os.path.join("essential_files", "microscope.ico")
@@ -859,7 +881,6 @@ class MainWindow(QMainWindow):
         self.was_maximized = False
         self.active_snippers = []
         self.last_screenshot_rgb = None
-        self.screenshot_engine_str = "Checking..."
         
         self.current_yolo_sahi_model = None
         
@@ -884,7 +905,7 @@ class MainWindow(QMainWindow):
         yolo_path = MODEL_PATHS.get(opt)
         self.current_yolo_sahi_model = None
 
-        if model_pref == 'Yolo_SAHI' and HAS_SAHI and yolo_path and os.path.exists(yolo_path):
+        if HAS_SAHI and yolo_path and os.path.exists(yolo_path):
             try:
                 self.current_yolo_sahi_model = AutoDetectionModel.from_pretrained(
                     model_type='ultralytics',
@@ -941,11 +962,6 @@ class MainWindow(QMainWindow):
         self.combo.addItems(list(MODEL_PATHS.keys()))
         layout_model.addWidget(self.combo)
         
-        model_btn_layout = QHBoxLayout()
-        self.btn_load = QPushButton("Reload")
-        model_btn_layout.addWidget(self.btn_load)
-        layout_model.addLayout(model_btn_layout)
-        
         self.group_model.setLayout(layout_model)
         left_layout.addWidget(self.group_model)
 
@@ -968,12 +984,12 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #ffad9f; }
         """)
         
-        self.btn_reset = QPushButton("Reset")
-        self.btn_reset.setStyleSheet("background: #64748b; color: white;")
+        self.btn_reset = QPushButton("Reset App")
+        self.btn_reset.setStyleSheet("background: #64748b; color: white; font-weight: bold; border-radius: 6px;")
         self.btn_reset.setFixedHeight(36)
         
-        settings_layout.addWidget(self.btn_advanced)
-        settings_layout.addWidget(self.btn_reset)
+        settings_layout.addWidget(self.btn_advanced, 1)
+        settings_layout.addWidget(self.btn_reset, 1)
         layout_controls.addLayout(settings_layout)
         
         # --- Advanced Settings Container ---
@@ -982,7 +998,6 @@ class MainWindow(QMainWindow):
         advanced_layout.setContentsMargins(0, 5, 0, 0)
         advanced_layout.setSpacing(10)
 
-        # Helper method for UI slider + checkbox pairs
         def create_adv_row(checkbox_text, slider_min, slider_max, slider_step, slider_val, val_label_text):
             row_w = QWidget()
             row_l = QHBoxLayout(row_w)
@@ -996,7 +1011,7 @@ class MainWindow(QMainWindow):
             sld.setMaximum(slider_max)
             sld.setSingleStep(slider_step)
             sld.setValue(slider_val)
-            sld.setEnabled(False) # Default disabled until checked
+            sld.setEnabled(False) # Disabled until checked
             
             lbl = QLabel(val_label_text)
             lbl.setStyleSheet("color: #334155; font-weight: bold; min-width: 30px;")
@@ -1004,51 +1019,24 @@ class MainWindow(QMainWindow):
             row_l.addWidget(chk)
             row_l.addWidget(sld)
             row_l.addWidget(lbl)
-            
-            # Enable slider when checked
             chk.toggled.connect(sld.setEnabled)
-            
             return row_w, chk, sld, lbl
 
-        # Gamma Correction
-        gamma_row, self.chk_gamma, self.slider_gamma, self.lbl_gamma_val = create_adv_row(
-            "Gamma Correction", 1, 30, 1, 10, "1.0"
-        )
-        self.slider_gamma.valueChanged.connect(lambda v: self.lbl_gamma_val.setText(f"{v/10.0:.1f}"))
-        self.slider_gamma.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_gamma.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(gamma_row)
+        # Image Pre-processing Parameters Title
+        lbl_preproc = QLabel("<b>Image pre-processing parameters:</b>")
+        lbl_preproc.setStyleSheet("color: #334155; font-size: 13px; margin-top: 5px;")
+        advanced_layout.addWidget(lbl_preproc)
 
-        # Median Blur
-        blur_row, self.chk_blur, self.slider_blur, self.lbl_blur_val = create_adv_row(
-            "Median Blur (Noise)", 1, 15, 2, 3, "3"
-        )
-        self.slider_blur.valueChanged.connect(lambda v: self.lbl_blur_val.setText(f"{v if v%2!=0 else v+1}"))
-        self.slider_blur.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_blur.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(blur_row)
-
-        # Bilateral Filtering
-        bilateral_row, self.chk_bilateral, self.slider_bilateral, self.lbl_bilateral_val = create_adv_row(
-            "Bilateral Filter", 1, 25, 2, 9, "9"
-        )
-        self.slider_bilateral.valueChanged.connect(lambda v: self.lbl_bilateral_val.setText(f"{v}"))
-        self.slider_bilateral.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_bilateral.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(bilateral_row)
-
-        # Stain Normalization (Reinhard)
-        norm_row, self.chk_norm, self.slider_norm, self.lbl_norm_val = create_adv_row(
-            "Stain Norm (Reinhard)", 0, 100, 5, 100, "1.00"
-        )
-        self.slider_norm.valueChanged.connect(lambda v: self.lbl_norm_val.setText(f"{v/100.0:.2f}"))
-        self.slider_norm.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_norm.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(norm_row)
+        # Macenko Checkbox (No slider)
+        self.chk_macenko = QCheckBox("Auto-calibrate stain colors (Macenko)")
+        self.chk_macenko.setStyleSheet("color: #334155; font-weight: 500;")
+        self.chk_macenko.setChecked(True)
+        self.chk_macenko.stateChanged.connect(self.on_advanced_setting_changed)
+        advanced_layout.addWidget(self.chk_macenko)
 
         # Stain Normalization (Vahadane)
         vahadane_row, self.chk_vahadane, self.slider_vahadane, self.lbl_vahadane_val = create_adv_row(
-            "Stain Norm (Vahadane)", 0, 100, 5, 100, "1.00"
+            "Stain Norm (Vahadane)", 0, 100, 5, 10, "0.10"
         )
         self.slider_vahadane.valueChanged.connect(lambda v: self.lbl_vahadane_val.setText(f"{v/100.0:.2f}"))
         self.slider_vahadane.sliderReleased.connect(self.on_advanced_setting_changed)
@@ -1057,7 +1045,7 @@ class MainWindow(QMainWindow):
         
         # CLAHE
         clahe_row, self.chk_clahe, self.slider_clahe, self.lbl_clahe_val = create_adv_row(
-            "CLAHE Enhancement", 1, 100, 5, 20, "2.0"
+            "CLAHE Enhancement", 1, 100, 5, 5, "0.5"
         )
         self.slider_clahe.valueChanged.connect(lambda v: self.lbl_clahe_val.setText(f"{v/10.0:.1f}"))
         self.slider_clahe.sliderReleased.connect(self.on_advanced_setting_changed)
@@ -1066,34 +1054,75 @@ class MainWindow(QMainWindow):
 
         # Unsharp Masking
         unsharp_row, self.chk_unsharp, self.slider_unsharp, self.lbl_unsharp_val = create_adv_row(
-            "Unsharp Masking", 0, 50, 1, 10, "1.0"
+            "Unsharp Masking", 0, 50, 1, 5, "0.5"
         )
         self.slider_unsharp.valueChanged.connect(lambda v: self.lbl_unsharp_val.setText(f"{v/10.0:.1f}"))
         self.slider_unsharp.sliderReleased.connect(self.on_advanced_setting_changed)
         self.chk_unsharp.stateChanged.connect(self.on_advanced_setting_changed)
         advanced_layout.addWidget(unsharp_row)
 
-        # Sobel Edge Filter
-        sobel_row, self.chk_sobel, self.slider_sobel, self.lbl_sobel_val = create_adv_row(
-            "Sobel Edge Filter", 0, 100, 5, 50, "0.50"
-        )
-        self.slider_sobel.valueChanged.connect(lambda v: self.lbl_sobel_val.setText(f"{v/100.0:.2f}"))
-        self.slider_sobel.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_sobel.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(sobel_row)
+        # Cell Filter Parameters Title
+        lbl_cell_filters = QLabel("<b>Cell filter parameters:</b>")
+        lbl_cell_filters.setStyleSheet("color: #334155; font-size: 13px; margin-top: 10px;")
+        advanced_layout.addWidget(lbl_cell_filters)
 
-        # Canny Edge Filter
-        canny_row, self.chk_canny, self.slider_canny, self.lbl_canny_val = create_adv_row(
-            "Canny Edge Filter", 0, 100, 5, 50, "0.50"
-        )
-        self.slider_canny.valueChanged.connect(lambda v: self.lbl_canny_val.setText(f"{v/100.0:.2f}"))
-        self.slider_canny.sliderReleased.connect(self.on_advanced_setting_changed)
-        self.chk_canny.stateChanged.connect(self.on_advanced_setting_changed)
-        advanced_layout.addWidget(canny_row)
+        # Include All Cells Checkbox
+        self.chk_include_all = QCheckBox("Include all cells")
+        self.chk_include_all.setStyleSheet("color: #334155; font-weight: 500;")
+        self.chk_include_all.setChecked(False)
+        self.chk_include_all.stateChanged.connect(self.on_include_all_changed)
+        self.chk_include_all.stateChanged.connect(self.on_advanced_setting_changed)
+        advanced_layout.addWidget(self.chk_include_all)
+
+        # Advanced Post-processing Filters
+        self.size_layout = QHBoxLayout()
+        self.lbl_size_title = QLabel("Size ratio (relative to positive):")
+        self.lbl_size_title.setStyleSheet("color: #334155; font-weight: 500;")
+        self.slider_size = QSlider(Qt.Orientation.Horizontal)
+        self.slider_size.setMinimum(0)
+        self.slider_size.setMaximum(100)
+        self.slider_size.setSingleStep(5)
+        self.slider_size.setValue(30)
+        self.lbl_size_val = QLabel("30%")
+        self.lbl_size_val.setStyleSheet("color: #334155; font-weight: bold; min-width: 30px;")
+        self.size_layout.addWidget(self.lbl_size_title)
+        self.size_layout.addWidget(self.slider_size)
+        self.size_layout.addWidget(self.lbl_size_val)
+        advanced_layout.addLayout(self.size_layout)
+        
+        self.circ_layout = QHBoxLayout()
+        self.lbl_circ_title = QLabel("Cellularity:")
+        self.lbl_circ_title.setStyleSheet("color: #334155; font-weight: 500;")
+        self.slider_circ = QSlider(Qt.Orientation.Horizontal)
+        self.slider_circ.setMinimum(0)
+        self.slider_circ.setMaximum(100)
+        self.slider_circ.setSingleStep(5)
+        self.slider_circ.setValue(40)
+        self.lbl_circ_val = QLabel("0.40")
+        self.lbl_circ_val.setStyleSheet("color: #334155; font-weight: bold; min-width: 30px;")
+        self.circ_layout.addWidget(self.lbl_circ_title)
+        self.circ_layout.addWidget(self.slider_circ)
+        self.circ_layout.addWidget(self.lbl_circ_val)
+        advanced_layout.addLayout(self.circ_layout)
+
+        self.round_layout = QHBoxLayout()
+        self.lbl_round_title = QLabel("Roundness:")
+        self.lbl_round_title.setStyleSheet("color: #334155; font-weight: 500;")
+        self.slider_round = QSlider(Qt.Orientation.Horizontal)
+        self.slider_round.setMinimum(0)
+        self.slider_round.setMaximum(100)
+        self.slider_round.setSingleStep(5)
+        self.slider_round.setValue(40)
+        self.lbl_round_val = QLabel("0.40")
+        self.lbl_round_val.setStyleSheet("color: #334155; font-weight: bold; min-width: 30px;")
+        self.round_layout.addWidget(self.lbl_round_title)
+        self.round_layout.addWidget(self.slider_round)
+        self.round_layout.addWidget(self.lbl_round_val)
+        advanced_layout.addLayout(self.round_layout)
 
         # User Toggle for Inverting Classes Dynamically
         self.chk_invert_yolo = QCheckBox("Invert YOLO/SAHI Classes (0=Negative, 1=Positive)")
-        self.chk_invert_yolo.setStyleSheet("color: #334155; font-weight: 500;")
+        self.chk_invert_yolo.setStyleSheet("color: #334155; font-weight: 500; margin-top: 10px;")
         self.chk_invert_yolo.setChecked(False)
         self.chk_invert_yolo.stateChanged.connect(self.on_advanced_setting_changed)
         advanced_layout.addWidget(self.chk_invert_yolo)
@@ -1111,7 +1140,6 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_save_settings)
         btn_layout.addWidget(self.btn_reset_settings)
         
-        # Wrap button layout in a widget to add margin
         btn_widget = QWidget()
         btn_widget.setLayout(btn_layout)
         btn_layout.setContentsMargins(0, 10, 0, 0)
@@ -1128,14 +1156,17 @@ class MainWindow(QMainWindow):
         layout_results = QVBoxLayout()
         layout_results.setSpacing(10)
 
-        self.lbl_class0 = QLabel("<b>Positive cells:</b> <span style='color: #8b0000;'>0</span>")
-        self.lbl_class1 = QLabel("<b>Negative cells:</b> <span style='color: #00008b;'>0</span>")
+        self.lbl_class0 = QLabel("<b>Positive cells:</b> <span style='color: red;'>0</span>")
+        self.lbl_class1 = QLabel("<b>Negative cells:</b> <span style='color: blue;'>0</span>")
+        self.lbl_er_details = QLabel("")
         
-        for lbl in (self.lbl_class0, self.lbl_class1):
+        for lbl in (self.lbl_class0, self.lbl_class1, self.lbl_er_details):
             lbl.setFont(QFont("Consolas", 11))
             lbl.setStyleSheet("color: #334155;")
             layout_results.addWidget(lbl)
             
+        self.lbl_er_details.setVisible(False)
+
         layout_results.addSpacing(5)
         
         self.lbl_kpi = QLabel("KPI: -")
@@ -1157,7 +1188,7 @@ class MainWindow(QMainWindow):
             "- Use the mouse wheel to zoom in and out of the image<br>"
             "- Right click on an annotation to delete<br>"
             "- Left click once to add a <span style='color: red;'>positive</span> annotation<br>"
-            "- Left click twice to add a <span style='color: blue;'>negative</span> annotation"
+            "- Left click twice to add a <span style='color: blue;'>negative</span> annotation<br>"
         )
         self.lbl_note = QLabel(note_text)
         self.lbl_note.setWordWrap(True)
@@ -1204,8 +1235,8 @@ class MainWindow(QMainWindow):
         disclaimer_text = (
             "<i><b style='color: red;'>Disclaimer:</b> This output is AI generated. "
             "Please verify and confirm results.<br><br>"
-            "This app was built using Google Gemini and uses YOLO and SAHI.<br><br>"
-            "<b>References:</b><ul>"
+            "This app was built using Google Gemini Pro and uses YOLO26 and SAHI.<br><br>"
+            "<b>References:</b><ul style='margin-top: 2px;'>"
             "<li>https://github.com/ultralytics/ultralytics</li>"
             "<li>https://github.com/obss/sahi</li>"
             "</ul></i>"
@@ -1235,11 +1266,46 @@ class MainWindow(QMainWindow):
         
         # Wire up signals
         self.combo.currentTextChanged.connect(self.on_option_changed)
-        self.btn_load.clicked.connect(self.on_load_clicked)
         self.btn_take_screenshot.clicked.connect(self.on_take_screenshot_clicked)
         self.btn_reset.clicked.connect(self.on_reset_clicked)
         self.btn_advanced.toggled.connect(self.advanced_container.setVisible)
-        self.video_widget.edits_changed.connect(self.on_recalculate_clicked)
+        self.video_widget.edits_changed.connect(self.on_recalculate_triggered)
+        
+        self.slider_size.valueChanged.connect(lambda v: self.lbl_size_val.setText(f"{v}%"))
+        self.slider_size.sliderReleased.connect(self.on_advanced_setting_changed)
+
+        self.slider_circ.valueChanged.connect(lambda v: self.lbl_circ_val.setText(f"{v/100.0:.2f}"))
+        self.slider_circ.sliderReleased.connect(self.on_advanced_setting_changed)
+
+        self.slider_round.valueChanged.connect(lambda v: self.lbl_round_val.setText(f"{v/100.0:.2f}"))
+        self.slider_round.sliderReleased.connect(self.on_advanced_setting_changed)
+        
+        # Enforce exact requested defaults at startup if no JSON overrides them
+        self.chk_macenko.setChecked(True)
+        self.chk_vahadane.setChecked(True)
+        self.slider_vahadane.setValue(10)
+        self.slider_vahadane.setEnabled(True)
+        self.chk_clahe.setChecked(True)
+        self.slider_clahe.setValue(5)
+        self.slider_clahe.setEnabled(True)
+        self.chk_unsharp.setChecked(True)
+        self.slider_unsharp.setValue(5)
+        self.slider_unsharp.setEnabled(True)
+
+    def on_include_all_changed(self):
+        is_checked = self.chk_include_all.isChecked()
+        # Toggle visual enabling of sliders based on 'Include all cells'
+        self.slider_size.setEnabled(not is_checked)
+        self.lbl_size_title.setEnabled(not is_checked)
+        self.lbl_size_val.setEnabled(not is_checked)
+
+        self.slider_circ.setEnabled(not is_checked)
+        self.lbl_circ_title.setEnabled(not is_checked)
+        self.lbl_circ_val.setEnabled(not is_checked)
+
+        self.slider_round.setEnabled(not is_checked)
+        self.lbl_round_title.setEnabled(not is_checked)
+        self.lbl_round_val.setEnabled(not is_checked)
 
     def load_settings(self):
         settings_path = os.path.join("essential_files", "settings.json")
@@ -1250,80 +1316,53 @@ class MainWindow(QMainWindow):
                 
                 # Block signals to prevent processing multiple times during load
                 self.chk_invert_yolo.blockSignals(True)
+                self.chk_macenko.blockSignals(True)
                 self.chk_clahe.blockSignals(True)
                 self.chk_unsharp.blockSignals(True)
-                self.chk_gamma.blockSignals(True)
-                self.chk_blur.blockSignals(True)
-                self.chk_bilateral.blockSignals(True)
-                self.chk_norm.blockSignals(True)
                 self.chk_vahadane.blockSignals(True)
-                self.chk_sobel.blockSignals(True)
-                self.chk_canny.blockSignals(True)
+                self.chk_include_all.blockSignals(True)
                 
                 # Apply states
                 self.chk_invert_yolo.setChecked(data.get("invert_classes", False))
+                self.chk_macenko.setChecked(data.get("macenko_enabled", True))
                 
-                self.chk_clahe.setChecked(data.get("clahe_enabled", False))
-                self.slider_clahe.setValue(data.get("clahe_value", 20))
+                self.chk_clahe.setChecked(data.get("clahe_enabled", True))
+                self.slider_clahe.setValue(data.get("clahe_value", 5))
                 
-                self.chk_unsharp.setChecked(data.get("unsharp_enabled", False))
-                self.slider_unsharp.setValue(data.get("unsharp_value", 10))
+                self.chk_unsharp.setChecked(data.get("unsharp_enabled", True))
+                self.slider_unsharp.setValue(data.get("unsharp_value", 5))
                 
-                self.chk_gamma.setChecked(data.get("gamma_enabled", False))
-                self.slider_gamma.setValue(data.get("gamma_value", 10))
+                self.chk_vahadane.setChecked(data.get("vahadane_enabled", True))
+                self.slider_vahadane.setValue(data.get("vahadane_value", 10))
                 
-                self.chk_blur.setChecked(data.get("blur_enabled", False))
-                self.slider_blur.setValue(data.get("blur_value", 3))
-                
-                self.chk_bilateral.setChecked(data.get("bilateral_enabled", False))
-                self.slider_bilateral.setValue(data.get("bilateral_value", 9))
-                
-                self.chk_norm.setChecked(data.get("norm_enabled", False))
-                self.slider_norm.setValue(data.get("norm_value", 100))
-                
-                self.chk_vahadane.setChecked(data.get("vahadane_enabled", False))
-                self.slider_vahadane.setValue(data.get("vahadane_value", 100))
-                
-                self.chk_sobel.setChecked(data.get("sobel_enabled", False))
-                self.slider_sobel.setValue(data.get("sobel_value", 50))
-                
-                self.chk_canny.setChecked(data.get("canny_enabled", False))
-                self.slider_canny.setValue(data.get("canny_value", 50))
+                self.chk_include_all.setChecked(data.get("include_all_cells", False))
+                self.slider_size.setValue(data.get("size_value", 30))
+                self.slider_circ.setValue(data.get("circ_value", 40))
+                self.slider_round.setValue(data.get("round_value", 40))
                 
                 # Enable sliders if checked
-                self.slider_gamma.setEnabled(self.chk_gamma.isChecked())
-                self.slider_blur.setEnabled(self.chk_blur.isChecked())
-                self.slider_bilateral.setEnabled(self.chk_bilateral.isChecked())
-                self.slider_norm.setEnabled(self.chk_norm.isChecked())
                 self.slider_vahadane.setEnabled(self.chk_vahadane.isChecked())
                 self.slider_clahe.setEnabled(self.chk_clahe.isChecked())
                 self.slider_unsharp.setEnabled(self.chk_unsharp.isChecked())
-                self.slider_sobel.setEnabled(self.chk_sobel.isChecked())
-                self.slider_canny.setEnabled(self.chk_canny.isChecked())
+                
+                # Visually update enablement based on 'Include all cells'
+                self.on_include_all_changed()
                 
                 # Update text labels
-                self.lbl_gamma_val.setText(f"{self.slider_gamma.value()/10.0:.1f}")
-                v = self.slider_blur.value()
-                self.lbl_blur_val.setText(f"{v if v%2!=0 else v+1}")
-                self.lbl_bilateral_val.setText(f"{self.slider_bilateral.value()}")
-                self.lbl_norm_val.setText(f"{self.slider_norm.value()/100.0:.2f}")
                 self.lbl_vahadane_val.setText(f"{self.slider_vahadane.value()/100.0:.2f}")
                 self.lbl_clahe_val.setText(f"{self.slider_clahe.value()/10.0:.1f}")
                 self.lbl_unsharp_val.setText(f"{self.slider_unsharp.value()/10.0:.1f}")
-                self.lbl_sobel_val.setText(f"{self.slider_sobel.value()/100.0:.2f}")
-                self.lbl_canny_val.setText(f"{self.slider_canny.value()/100.0:.2f}")
+                self.lbl_size_val.setText(f"{self.slider_size.value()}%")
+                self.lbl_circ_val.setText(f"{self.slider_circ.value()/100.0:.2f}")
+                self.lbl_round_val.setText(f"{self.slider_round.value()/100.0:.2f}")
 
                 # Unblock signals
                 self.chk_invert_yolo.blockSignals(False)
+                self.chk_macenko.blockSignals(False)
                 self.chk_clahe.blockSignals(False)
                 self.chk_unsharp.blockSignals(False)
-                self.chk_gamma.blockSignals(False)
-                self.chk_blur.blockSignals(False)
-                self.chk_bilateral.blockSignals(False)
-                self.chk_norm.blockSignals(False)
                 self.chk_vahadane.blockSignals(False)
-                self.chk_sobel.blockSignals(False)
-                self.chk_canny.blockSignals(False)
+                self.chk_include_all.blockSignals(False)
                 
             except Exception as e:
                 self.set_status(f"Error loading settings: {e}")
@@ -1333,24 +1372,17 @@ class MainWindow(QMainWindow):
         settings_path = os.path.join("essential_files", "settings.json")
         data = {
             "invert_classes": self.chk_invert_yolo.isChecked(),
+            "macenko_enabled": self.chk_macenko.isChecked(),
             "clahe_enabled": self.chk_clahe.isChecked(),
             "clahe_value": self.slider_clahe.value(),
             "unsharp_enabled": self.chk_unsharp.isChecked(),
             "unsharp_value": self.slider_unsharp.value(),
-            "gamma_enabled": self.chk_gamma.isChecked(),
-            "gamma_value": self.slider_gamma.value(),
-            "blur_enabled": self.chk_blur.isChecked(),
-            "blur_value": self.slider_blur.value(),
-            "bilateral_enabled": self.chk_bilateral.isChecked(),
-            "bilateral_value": self.slider_bilateral.value(),
-            "norm_enabled": self.chk_norm.isChecked(),
-            "norm_value": self.slider_norm.value(),
             "vahadane_enabled": self.chk_vahadane.isChecked(),
             "vahadane_value": self.slider_vahadane.value(),
-            "sobel_enabled": self.chk_sobel.isChecked(),
-            "sobel_value": self.slider_sobel.value(),
-            "canny_enabled": self.chk_canny.isChecked(),
-            "canny_value": self.slider_canny.value()
+            "include_all_cells": self.chk_include_all.isChecked(),
+            "size_value": self.slider_size.value(),
+            "circ_value": self.slider_circ.value(),
+            "round_value": self.slider_round.value()
         }
         try:
             with open(settings_path, 'w') as f:
@@ -1362,72 +1394,48 @@ class MainWindow(QMainWindow):
     def on_reset_settings_clicked(self):
         # Block signals to prevent continuous reprocessing
         self.chk_invert_yolo.blockSignals(True)
+        self.chk_macenko.blockSignals(True)
         self.chk_clahe.blockSignals(True)
         self.chk_unsharp.blockSignals(True)
-        self.chk_gamma.blockSignals(True)
-        self.chk_blur.blockSignals(True)
-        self.chk_bilateral.blockSignals(True)
-        self.chk_norm.blockSignals(True)
         self.chk_vahadane.blockSignals(True)
-        self.chk_sobel.blockSignals(True)
-        self.chk_canny.blockSignals(True)
+        self.chk_include_all.blockSignals(True)
         
-        # Reset Checkboxes
+        # Restore Requested Defaults
         self.chk_invert_yolo.setChecked(False)
-        self.chk_clahe.setChecked(False)
-        self.chk_unsharp.setChecked(False)
-        self.chk_gamma.setChecked(False)
-        self.chk_blur.setChecked(False)
-        self.chk_bilateral.setChecked(False)
-        self.chk_norm.setChecked(False)
-        self.chk_vahadane.setChecked(False)
-        self.chk_sobel.setChecked(False)
-        self.chk_canny.setChecked(False)
+        self.chk_macenko.setChecked(True)
+        self.chk_clahe.setChecked(True)
+        self.slider_clahe.setValue(5)
+        self.chk_unsharp.setChecked(True)
+        self.slider_unsharp.setValue(5)
+        self.chk_vahadane.setChecked(True)
+        self.slider_vahadane.setValue(10)
+        self.chk_include_all.setChecked(False)
         
-        # Reset Sliders
-        self.slider_clahe.setValue(20)
-        self.slider_unsharp.setValue(10)
-        self.slider_gamma.setValue(10)
-        self.slider_blur.setValue(3)
-        self.slider_bilateral.setValue(9)
-        self.slider_norm.setValue(100)
-        self.slider_vahadane.setValue(100)
-        self.slider_sobel.setValue(50)
-        self.slider_canny.setValue(50)
+        self.slider_size.setValue(30)
+        self.slider_circ.setValue(40)
+        self.slider_round.setValue(40)
         
-        # Disable Sliders
-        self.slider_gamma.setEnabled(False)
-        self.slider_blur.setEnabled(False)
-        self.slider_bilateral.setEnabled(False)
-        self.slider_norm.setEnabled(False)
-        self.slider_vahadane.setEnabled(False)
-        self.slider_clahe.setEnabled(False)
-        self.slider_unsharp.setEnabled(False)
-        self.slider_sobel.setEnabled(False)
-        self.slider_canny.setEnabled(False)
+        # Ensure enabled states
+        self.slider_clahe.setEnabled(True)
+        self.slider_unsharp.setEnabled(True)
+        self.slider_vahadane.setEnabled(True)
+        self.on_include_all_changed()
         
         # Update text labels
-        self.lbl_gamma_val.setText("1.0")
-        self.lbl_blur_val.setText("3")
-        self.lbl_bilateral_val.setText("9")
-        self.lbl_norm_val.setText("1.00")
-        self.lbl_vahadane_val.setText("1.00")
-        self.lbl_clahe_val.setText("2.0")
-        self.lbl_unsharp_val.setText("1.0")
-        self.lbl_sobel_val.setText("0.50")
-        self.lbl_canny_val.setText("0.50")
+        self.lbl_clahe_val.setText("0.5")
+        self.lbl_unsharp_val.setText("0.5")
+        self.lbl_vahadane_val.setText("0.10")
+        self.lbl_size_val.setText("30%")
+        self.lbl_circ_val.setText("0.40")
+        self.lbl_round_val.setText("0.40")
         
         # Unblock signals
         self.chk_invert_yolo.blockSignals(False)
+        self.chk_macenko.blockSignals(False)
         self.chk_clahe.blockSignals(False)
         self.chk_unsharp.blockSignals(False)
-        self.chk_gamma.blockSignals(False)
-        self.chk_blur.blockSignals(False)
-        self.chk_bilateral.blockSignals(False)
-        self.chk_norm.blockSignals(False)
         self.chk_vahadane.blockSignals(False)
-        self.chk_sobel.blockSignals(False)
-        self.chk_canny.blockSignals(False)
+        self.chk_include_all.blockSignals(False)
         
         self.save_settings()
         self.on_advanced_setting_changed()
@@ -1443,42 +1451,86 @@ class MainWindow(QMainWindow):
             self.set_status("Reprocessing captured region with new settings...")
             self.process_screenshot()
 
-    def on_recalculate_clicked(self):
-        """Forces KPI and count recalculation based on manually added/deleted boxes in the viewer"""
+    def on_recalculate_triggered(self):
+        """Forces KPI and count recalculation dynamically on manual UI edits"""
         if self.last_screenshot_rgb is None or not hasattr(self.video_widget, 'boxes'):
-            self.set_status("No active image to recalculate.")
             return
 
         current_opt = self.combo.currentText()
         boxes = self.video_widget.boxes
         
-        c0 = sum(1 for b in boxes if b[4] == 0)
-        c1 = sum(1 for b in boxes if b[4] == 1)
-        counts = {0: c0, 1: c1}
-        
-        denom = c0 + c1
-        pct = (c0 / denom * 100.0) if denom > 0 else 0.0
-        
+        counts = {'pos': 0, 'neg': 0, 'weak': 0, 'mod': 0, 'strong': 0, 'total': 0}
+        for b in boxes:
+            cid = b[4]
+            if cid == 1:
+                counts['neg'] += 1
+            elif current_opt == "ER/PR analysis":
+                if cid == 2: counts['weak'] += 1
+                elif cid == 3: counts['mod'] += 1
+                elif cid in (0, 4): counts['strong'] += 1
+            else:
+                if cid == 0: counts['pos'] += 1
+                
         if current_opt == "ER/PR analysis":
-            kpi_text = f"ER/PR Positive Index: {pct:.1f}%"
-        else:
-            kpi_text = f"KI67 index : {pct:.1f}%"
+            counts['pos'] = counts['weak'] + counts['mod'] + counts['strong']
+            counts['total'] = counts['pos'] + counts['neg']
+            c_pos = counts['pos']
+            total = counts['total']
             
-        payload = {
-            'class_counts': {f"class_{k}": int(v) for k, v in counts.items()},
-            'kpi_text': kpi_text,
-            'class_names': CLASS_NAMES.get(current_opt, ["Positive cells", "Negative cells"])
-        }
+            pct = (c_pos / total * 100.0) if total > 0 else 0.0
+            
+            ps = 0
+            if total > 0:
+                prop = c_pos / total
+                if prop == 0: ps = 0
+                elif prop < 0.01: ps = 1
+                elif prop <= 0.10: ps = 2
+                elif prop <= 0.33: ps = 3
+                elif prop <= 0.66: ps = 4
+                else: ps = 5
+                
+            is_score = 0
+            if c_pos > 0:
+                is_score = round((counts['weak']*1 + counts['mod']*2 + counts['strong']*3) / c_pos)
+                
+            allred = ps + is_score
+            status = "Positive" if allred >= 3 else "Negative"
+            
+            kpi_text = (f"ER/PR positive cells: {pct:.1f}%<br><br>"
+                        f"Allred score: {allred}/8 ({status})<br>"
+                        f"<span style='font-weight: normal;'>Proportion: {ps}/5, Intensity: {is_score}/3</span>")
+            
+            payload = {
+                'class_counts': {
+                    'class_pos': c_pos, 'class_neg': counts['neg'],
+                    'class_weak': counts['weak'], 'class_mod': counts['mod'],
+                    'class_strong': counts['strong'], 'class_total': total
+                },
+                'kpi_text': kpi_text
+            }
+        else:
+            c_pos = counts['pos']
+            c_neg = counts['neg']
+            denom = c_pos + c_neg
+            pct = (c_pos / denom * 100.0) if denom > 0 else 0.0
+            
+            kpi_text = f"KI67 index : {pct:.1f}%"
+            payload = {
+                'class_counts': {'class_0': c_pos, 'class_1': c_neg},
+                'kpi_text': kpi_text
+            }
+            
         self.update_counts(payload)
-        self.set_status("Cell counts recalculated based on manual UI edits.")
+        self.set_status("Cell counts recalculated.")
 
     def on_reset_clicked(self):
         self.last_screenshot_rgb = None
         self.video_widget.set_placeholder_text("Select an AI model to begin")
         self.update_frame(None)
         names = CLASS_NAMES.get(self.combo.currentText(), ["Positive cells", "Negative cells"])
-        self.lbl_class0.setText(f"<b>{names[0]}:</b> <span style='color: #8b0000;'>0</span>")
-        self.lbl_class1.setText(f"<b>{names[1]}:</b> <span style='color: #00008b;'>0</span>")
+        self.lbl_class0.setText(f"<b>{names[0]}:</b> <span style='color: red;'>0</span>")
+        self.lbl_class1.setText(f"<b>{names[1]}:</b> <span style='color: blue;'>0</span>")
+        self.lbl_er_details.setVisible(False)
         self.lbl_kpi.setText("KPI: -")
         self.set_status("Results cleared.")
             
@@ -1547,42 +1599,29 @@ class MainWindow(QMainWindow):
             return
             
         frame_rgb = self.last_screenshot_rgb
-        h, w, _ = frame_rgb.shape
         
         current_opt = self.combo.currentText()
         invert_classes = self.chk_invert_yolo.isChecked()
         
-        # Capture settings
+        # Capture pre-processing settings
+        use_macenko = self.chk_macenko.isChecked()
+        
+        use_vahadane = self.chk_vahadane.isChecked()
+        vahadane_val = self.slider_vahadane.value() / 100.0
+        
         use_clahe = self.chk_clahe.isChecked()
         clahe_val = self.slider_clahe.value() / 10.0
         
         use_unsharp = self.chk_unsharp.isChecked()
         unsharp_val = self.slider_unsharp.value() / 10.0
         
-        use_gamma = self.chk_gamma.isChecked()
-        gamma_val = self.slider_gamma.value() / 10.0
-        
-        use_blur = self.chk_blur.isChecked()
-        blur_val = self.slider_blur.value()
-        if blur_val % 2 == 0: blur_val += 1
-        
-        use_bilateral = self.chk_bilateral.isChecked()
-        bilateral_val = self.slider_bilateral.value()
-        
-        use_norm = self.chk_norm.isChecked()
-        norm_val = self.slider_norm.value() / 100.0
-        
-        use_vahadane = self.chk_vahadane.isChecked()
-        vahadane_val = self.slider_vahadane.value() / 100.0
-        
-        use_sobel = self.chk_sobel.isChecked()
-        sobel_val = self.slider_sobel.value() / 100.0
-        
-        use_canny = self.chk_canny.isChecked()
-        canny_val = self.slider_canny.value() / 100.0
+        # Capture shape filtering settings
+        include_all_cells = self.chk_include_all.isChecked()
+        size_pct_thresh = self.slider_size.value() / 100.0
+        circ_thresh = self.slider_circ.value() / 100.0
+        round_thresh = self.slider_round.value() / 100.0
         
         model_to_use = None
-        
         if getattr(self, 'current_yolo_sahi_model', None):
             model_to_use = self.current_yolo_sahi_model
 
@@ -1594,7 +1633,6 @@ class MainWindow(QMainWindow):
             self.btn_reset.setEnabled(True)
             return
 
-        # Ensure active model label is up-to-date with actual fallback used
         self.update_active_model_label()
 
         def update_progress(pct, msg):
@@ -1604,26 +1642,23 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
         self.btn_take_screenshot.setEnabled(False)
-        self.btn_reset.setEnabled(False)
 
         # Run Universal CPU Inference with Enhancement Options
-        drawn_rgb_or_bgr, counts, kpi_text, class_names, boxes_out = run_screenshot_inference(
-            frame_rgb, model_to_use, current_opt, CLASS_NAMES, 
+        drawn_rgb_or_bgr, boxes_out = run_screenshot_inference(
+            frame_rgb, model_to_use, current_opt,
             progress_callback=update_progress, invert_classes=invert_classes,
+            use_macenko=use_macenko,
+            use_vahadane=use_vahadane, vahadane_val=vahadane_val,
             use_clahe=use_clahe, clahe_val=clahe_val,
             use_unsharp=use_unsharp, unsharp_val=unsharp_val,
-            use_gamma=use_gamma, gamma_val=gamma_val,
-            use_blur=use_blur, blur_val=blur_val,
-            use_bilateral=use_bilateral, bilateral_val=bilateral_val,
-            use_norm=use_norm, norm_val=norm_val,
-            use_vahadane=use_vahadane, vahadane_val=vahadane_val,
-            use_sobel=use_sobel, sobel_val=sobel_val,
-            use_canny=use_canny, canny_val=canny_val
+            include_all_cells=include_all_cells,
+            size_pct_thresh=size_pct_thresh, circ_thresh=circ_thresh, round_thresh=round_thresh
         )
         
         self.progress_bar.setVisible(False)
         self.progress_bar.setValue(0)
         
+        h, w, _ = frame_rgb.shape
         bpl = 3 * w
         
         # Original Image (always RGB raw capture)
@@ -1635,27 +1670,41 @@ class MainWindow(QMainWindow):
         # Set images AND vector box coordinates directly to the UI Widget
         self.video_widget.set_images(qt_res, original_qimg=qt_orig, boxes=boxes_out)
         
-        payload = {
-            'class_counts': {f"class_{k}": int(v) for k, v in counts.items()},
-            'kpi_text': kpi_text,
-            'class_names': class_names
-        }
-        self.update_counts(payload)
+        # Trigger KPI calculation based on exactly what was injected into the viewer
+        self.on_recalculate_triggered()
+        
         self.set_status("Capture analysis complete. Hover to pan/zoom, click to edit boxes.")
         self.btn_take_screenshot.setEnabled(True)
-        self.btn_reset.setEnabled(True)
 
     def update_frame(self, qimage: QImage, orig_qimage: QImage = None):
         self.video_widget.set_images(qimage, orig_qimage)
 
     def update_counts(self, payload: dict):
         cn = payload.get('class_counts', {})
-        names = payload.get('class_names', CLASS_NAMES.get(self.combo.currentText(), ["class_0","class_1"]))
         
-        c0 = cn.get("class_0", 0)
-        c1 = cn.get("class_1", 0)
-        self.lbl_class0.setText(f"<b>{names[0]}:</b> <span style='color: #8b0000;'>{c0}</span>")
-        self.lbl_class1.setText(f"<b>{names[1]}:</b> <span style='color: #00008b;'>{c1}</span>")
+        if self.combo.currentText() == "ER/PR analysis":
+            p = cn.get("class_pos", 0)
+            n = cn.get("class_neg", 0)
+            w = cn.get("class_weak", 0)
+            m = cn.get("class_mod", 0)
+            s = cn.get("class_strong", 0)
+            
+            self.lbl_class0.setText(f"<b>Positive cells:</b> <span style='color: red;'>{p}</span>")
+            self.lbl_class1.setText(f"<b>Negative cells:</b> <span style='color: blue;'>{n}</span>")
+            
+            self.lbl_er_details.setText(
+                f"<b>Intensity breakdown:</b><br>"
+                f"Weak cells: <span style='color: #b8b800;'>{w}</span><br>"
+                f"Moderate cells: <span style='color: #ffa500;'>{m}</span><br>"
+                f"Strong cells: <span style='color: red;'>{s}</span>"
+            )
+            self.lbl_er_details.setVisible(True)
+        else:
+            c0 = cn.get("class_0", 0)
+            c1 = cn.get("class_1", 0)
+            self.lbl_class0.setText(f"<b>Positive cells:</b> <span style='color: red;'>{c0}</span>")
+            self.lbl_class1.setText(f"<b>Negative cells:</b> <span style='color: blue;'>{c1}</span>")
+            self.lbl_er_details.setVisible(False)
 
         self.lbl_kpi.setText(payload.get('kpi_text', ''))
 
@@ -1664,10 +1713,10 @@ class MainWindow(QMainWindow):
 
     def on_option_changed(self, option_text: str):
         try:
-            names = CLASS_NAMES.get(option_text, ["class_0","class_1"])
-            self.lbl_class0.setText(f"<b>{names[0]}:</b> <span style='color: #8b0000;'>0</span>")
-            self.lbl_class1.setText(f"<b>{names[1]}:</b> <span style='color: #00008b;'>0</span>")
+            self.lbl_class0.setText(f"<b>Positive cells:</b> <span style='color: red;'>0</span>")
+            self.lbl_class1.setText(f"<b>Negative cells:</b> <span style='color: blue;'>0</span>")
             self.lbl_kpi.setText("KPI: -")
+            self.lbl_er_details.setVisible(False)
             
             self._load_screenshot_models()
             self.update_active_model_label()
@@ -1677,10 +1726,6 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
             self.set_status(str(e))
-
-    def on_load_clicked(self):
-        self._load_screenshot_models()
-
 
 def main():
     if hasattr(Qt.HighDpiScaleFactorRoundingPolicy, 'PassThrough'):
